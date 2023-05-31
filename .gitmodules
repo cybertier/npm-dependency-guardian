@@ -1,0 +1,3 @@
+[submodule "nodejs-patch/node"]
+	path = nodejs-patch/node
+	url = https://github.com/nodejs/node
