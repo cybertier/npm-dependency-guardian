@@ -1,0 +1,1492 @@
+diff --git a/lib/internal/global-replacement/acornWalkPatch.js b/lib/internal/global-replacement/acornWalkPatch.js
+new file mode 100644
+index 0000000000..161f7f18da
+--- /dev/null
++++ b/lib/internal/global-replacement/acornWalkPatch.js
+@@ -0,0 +1,28 @@
++const acorn_walk = require('internal/deps/acorn/acorn-walk/dist/walk');
++
++// patch acorn-walk walkers to catch all identifiers
++
++acorn_walk.base.ObjectPattern = function(node, st, c) {
++  for (var i = 0, list = node.properties; i < list.length; i += 1) {
++    var prop = list[i];
++
++    c(prop, st, prop.type);
++    // if (prop.type === "Property") {
++    //   c(prop, st, "Property");
++    //   // c(prop.key, st, "Expression");
++    //   // c(prop.value, st, "Pattern");
++    // } else if (prop.type === "RestElement") {
++    //   c(prop.argument, st, "Pattern");
++    // }
++  }
++};
++
++acorn_walk.base.MemberExpression = function(node, st, c) {
++  c(node.object, st, "Expression");
++  c(node.property, st, "Expression");
++};
++
++acorn_walk.base.MethodDefinition = acorn_walk.base.PropertyDefinition = acorn_walk.base.Property = function(node, st, c) {
++  c(node.key, st, "Expression");
++  if (node.value) { c(node.value, st, "Expression"); }
++};
+diff --git a/lib/internal/global-replacement/astUtils.js b/lib/internal/global-replacement/astUtils.js
+new file mode 100644
+index 0000000000..f29c87cfd4
+--- /dev/null
++++ b/lib/internal/global-replacement/astUtils.js
+@@ -0,0 +1,413 @@
++const acorn = require('internal/deps/acorn/acorn/dist/acorn');
++
++/**
++ * "Enum" for the different types of AST nodes available in acorn that are used in this module
++ */
++const NodeTypes = {
++  ArrayPattern: 'ArrayPattern',
++  ArrowFunctionExpression: 'ArrowFunctionExpression',
++  AssignmentExpression: 'AssignmentExpression',
++  AssignmentPattern: 'AssignmentPattern',
++  BlockStatement: 'BlockStatement',
++  CallExpression: 'CallExpression',
++  Function: 'Function',
++  FunctionDeclaration: 'FunctionDeclaration',
++  FunctionExpression: 'FunctionExpression',
++  Identifier: 'Identifier',
++  ImportDeclaration: 'ImportDeclaration',
++  ImportDefaultSpecifier: 'ImportDefaultSpecifier',
++  ImportExpression: 'ImportExpression',
++  ImportNamespaceSpecifier: 'ImportNamespaceSpecifier',
++  ImportSpecifier: 'ImportSpecifier',
++  Literal: 'Literal',
++  MemberExpression: 'MemberExpression',
++  MethodDefinition: 'MethodDefinition',
++  ObjectPattern: 'ObjectPattern',
++  Program: 'Program',
++  Property: 'Property',
++  RestElement: 'RestElement',
++  SequenceExpression: 'SequenceExpression',
++  UpdateExpression: 'UpdateExpression',
++  UnaryExpression: 'UnaryExpression',
++  VariableDeclaration: 'VariableDeclaration',
++  VariableDeclarator: 'VariableDeclarator',
++}
++
++
++/**
++ * "Enum" for the different types of Environments that are available.
++ * This represents the different types of scopes available in JavaScript
++ */
++const EnvironmentTypes = {
++  Program: 'Program',
++  Function: 'Function',
++  Method: 'Method',
++  Block: 'Block'
++};
++
++
++/**
++ * Class that tracks environments/scopes during AST traversal
++ */
++class Environment {
++  constructor(type, start, end, parent, initial_vars) {
++    this.type = type;
++    this.start = start;
++    this.end = end;
++    this.parent = parent;
++    this.vars = initial_vars || new Array();
++    this.children = new Array();
++  }
++
++  /**
++   * Add a new environment to the list of child environments
++   * @param {Environment} child The child environment to add
++   */
++  addChild(child) {
++    this.children.push(child);
++  }
++
++  /**
++   * Add a new variable to the current environment
++   * @param {Variable} variable The variable to add
++   */
++  addVar(variable) {
++    this.vars.push(variable);
++  }
++
++  /**
++   * Add a new variable to the closest surrounding function scope
++   * @param {Variable} variable The varialbe to add
++   */
++  addVarToFunctionScope(variable) {
++    let env = this;
++    while ((env.type !== EnvironmentTypes.Function &&
++            env.type !== EnvironmentTypes.Method) &&
++           env.parent !== null) {
++      env = env.parent;
++    }
++    env.vars.push(variable);
++  }
++
++  /**
++   * Get a list of all variables available in the current environment
++   * @returns {Variable[]} List of variables available in the current environment
++   */
++  allVars() {
++    return this.parent === null ? this.vars : this.vars.concat(this.parent.allVars());
++  }
++
++  /**
++   * Get a module referencing variable that has a given name within the environment
++   * @param   {String}    name The name of the variable to get
++   * @returns {Variable?}      The variable, if it exists, else null
++   */
++  getModRefVarNamed(name) {
++    const variable = this.getVarNamed(name);
++    if (variable === null) {
++      return null;
++    }
++    return variable.module === null ? null : variable;
++  }
++
++  /**
++   * Get a variable of a given name within the environment
++   * @param   {String}    name The name of the variable to get
++   * @returns {Variable?}      The variable of that name, if it exists, else null
++   */
++  getVarNamed(name) {
++    for (const variable of this.vars) {
++      if (variable.name === name) {
++        return variable;
++      }
++    }
++    return this.parent === null ? null : this.parent.getVarNamed(name);
++  }
++
++  /**
++   * Indicates whether there is a variable with a given name in this environment
++   * @param   {String}  name The name of the variable to look for
++   * @returns {boolean}      true if a variable of the given name exists, else false
++   */
++  hasVarNamed(name) {
++    return this.getVarNamed(name) !== null;
++  }
++}
++
++
++/**
++ * Class representing access to a member of a module
++ */
++class MemberAccess {
++  /**
++   * @param {String} module     The module whose member is accessed
++   * @param {String} memberName The name of the member that is accessed
++   */
++  constructor(module, memberName) {
++    this.module = module;
++    this.memberName = memberName;
++  }
++
++  /**
++   * Create a MemberAccess instance from a string in the form "module.property"
++   * @param   {String}       accessString The string that the member access is created from
++   * @returns {MemberAccess}              The resulting MemberAccess instance
++   */
++  static fromString(accessString) {
++    const splits = accessString.split('.');
++    const mod = splits.splice(0, splits.length - 1).join('.');
++    const member = splits[splits.length - 1];
++    return new MemberAccess(mod, member);
++  }
++
++  /**
++   * Create a string for this member access in the form "module.property"
++   * @returns {String} the member access string
++   */
++  toString() {
++    return `${this.module}.${this.memberName}`
++  }
++}
++
++
++/**
++ * Represents a local variable inside an Environment
++ */
++class Variable {
++  /**
++   * @param {String}  variableName Name of the variable
++   * @param {String?} module       Name of the module that the variable is referencing, if any, else null
++   */
++  constructor(variableName, module = null) {
++    this.name = variableName;
++    this.module = module; // May be null
++  }
++
++  /**
++   * Make this variable a module referencing variable, referencing the given module
++   * @param {String} module The module the variable is referencing
++   */
++  setModule(module) {
++    this.module = module;
++  }
++
++  /**
++   * Check whether this variable is referencing a module
++   * @returns {boolean} true if the variable is referencing a module, else false
++   */
++  moduleReferencing() {
++    return this.module !== null;
++  }
++}
++
++
++/**
++ * Check whether a given node BlockStatement node marks the beginning of a function body
++ * @param   {Object[]} ancestors List of the BlockStatements ancestors
++ * @returns {boolean}            true if the BlockStatement is the beginning of a function body, else false
++ */
++function isFunction(ancestors) {
++  return (ancestors.length >= 2 &&
++    (ancestors[ancestors.length - 2].type === NodeTypes.FunctionDeclaration ||
++      ancestors[ancestors.length - 2].type === NodeTypes.Function ||
++      ancestors[ancestors.length - 2].type === NodeTypes.FunctionExpression ||
++      ancestors[ancestors.length - 2].type === NodeTypes.ArrowFunctionExpression))
++}
++
++
++/**
++ * Check whether a given node BlockStatement node marks the beginning of a method body
++ * @param   {Object[]} ancestors List of the BlockStatements ancestors
++ * @returns {boolean}            true if the BlockStatement is the beginning of a method body, else false
++ */
++function isMethod(ancestors) {
++  return (ancestors.length >= 3 &&
++    ancestors[ancestors.length - 3].type === NodeTypes.MethodDefinition);
++}
++
++
++/**
++ * Get all the identifiers that are created for a given AST node
++ * @param   {Object}   node The AST node
++ * @returns {String[]}      The resulting identifiers
++ */
++function identifiersFromNode(node) {
++  const identifiers = [];
++  switch (node.type) {
++    case NodeTypes.Identifier:
++      return [node];
++    case NodeTypes.RestElement:
++      return identifiersFromNode(node.argument).flat();
++    case NodeTypes.AssignmentPattern:
++      return identifiersFromNode(node.left).flat();
++    case NodeTypes.ObjectPattern:
++      for (const prop of node.properties) {
++        identifiers.push(identifiersFromNode(prop));
++      }
++      return identifiers.flat();
++    case NodeTypes.ArrayPattern:
++      for (const element of node.elements) {
++        // something like let [, a] = b; is valid
++        if (element !== null) {
++          identifiers.push(identifiersFromNode(element));
++        }
++      }
++      return identifiers.flat();
++    case NodeTypes.Property:
++      return identifiersFromNode(node.value).flat();
++    case NodeTypes.UpdateExpression:
++    case NodeTypes.UnaryExpression:
++      return identifiersFromNode(node.argument).flat();
++  }
++  throw Error(`Unknown node type: ${node.type}`);
++}
++
++
++/**
++ * Get all the variable names that are created during a single import declaration
++ * @param   {Object}   node The ImportDeclaration node
++ * @returns {String[]}      List of resulting identifiers
++ */
++function identifiersFromImportDeclaration(node) {
++  return node.specifiers.map((spec) => spec.local);
++}
++
++
++// Implementing all possible patterns according to MDN https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Statements/let
++/**
++ * Get all the variables that are created during a single variable declaration
++ * @param   {Object}   node The VariableDeclaration node
++ * @returns {String[]}      List of resulting identifiers
++ */
++function identifiersFromVariableDeclaration(node) {
++  const variables = [];
++  for (const declarator of node.declarations) {
++    variables.push(identifiersFromNode(declarator.id));
++  }
++  return variables.flat();
++}
++
++/**
++ * Track variables that are in scope across AST nodes
++ * @param   {Object}      node      The current AST node
++ * @param   {String}      type      The type of the AST node
++ * @param   {Environment} env       Current environment holding the known variables
++ * @returns {Environment}           The resulting environment
++ */
++function trackVars(node, type, env) {
++  switch (type) {
++    case NodeTypes.ImportDeclaration:
++      // Import and export may only appear at the top level, according to the AST explorer (find doc
++      // src!), so this is always a kind of "global scope".
++      for (const identifier of identifiersFromImportDeclaration(node)) {
++        env.addVar(new Variable(identifier.name));
++      }
++      break;
++    // const and let are block-scoped, var is function scoped
++    case NodeTypes.VariableDeclaration:
++      if (node.kind === 'var') {
++        for (const identifier of identifiersFromVariableDeclaration(node)) {
++          env.addVarToFunctionScope(new Variable(identifier.name));
++        }
++      } else {
++        for (const identifier of identifiersFromVariableDeclaration(node)) {
++          env.addVar(new Variable(identifier.name));
++        }
++      }
++      break;
++    // TODO: this should also look at assignment expressions, and if there is no variable in any of
++    // the surrounding envs with the given name, that variable should also be added! (because unless
++    // we're in "use strict;" we can create variables without cont/let/var)
++  }
++  // As we don't reassign env, this may be redundant
++  return env;
++}
++
++
++/**
++ * Creates variables for the parameters of a function node
++ * @param   {Object[]}   ancestors List of ancestor nodes
++ * @returns {Variable[]}           List of resulting variables
++ */
++function initialVarsForFunction(ancestors) {
++  return ancestors[ancestors.length - 2].params.map(identifiersFromNode).flat().map(
++    (identifier) => new Variable(identifier.name)
++  );
++}
++
++
++/**
++ * Track scope changes during the AST traversal
++ * @param   {Object}      node      The current AST node
++ * @param   {String}      type      The type of the AST node
++ * @param   {Object[]}    ancestors List of ancestor nodes
++ * @param   {Environment} env       Current environment holding the known variables
++ * @returns {Environment}           The resulting environment
++ */
++function trackScope(node, type, ancestors, env) {
++  switch (type) {
++    case NodeTypes.Program:
++      env = new Environment(EnvironmentTypes.Program, node.start, node.end, null);
++      break;
++    case NodeTypes.BlockStatement:
++      // FIXME: tracing of class attributes (accessible via this.) does not work
++      // Determine whether within a function or method
++      let env_type;
++      let initial_vars;
++      if (isFunction(ancestors)) {
++        initial_vars = initialVarsForFunction(ancestors);
++        env_type = EnvironmentTypes.Function;
++      } else if (isMethod(ancestors)) {
++        initial_vars = initialVarsForFunction(ancestors);
++        env_type = EnvironmentTypes.Method;
++      } else {
++        env_type = EnvironmentTypes.Block;
++      }
++      let new_env = new Environment(env_type, node.start, node.end, env, initial_vars);
++      env.addChild(new_env);
++      env = new_env;
++      break;
++  }
++  return env;
++}
++
++
++/**
++ * Build an AST from source code
++ * @param   {String}  content   The source code to build the AST from
++ * @param   {boolean} locations Whether the AST nodes should include source code locations
++ * @returns {Object?}           The AST, or `null` if parsing failed
++ */
++function buildTree(content, locations = false) {
++  let tree = null;
++  // TODO: is it valid to always assume module source type?
++  // From the v8 ES Module docs at https://v8.dev/features/modules :
++  // > Because of these differences, the same JavaScript code might behave differently when treated
++  // > as a module vs. a classic script. As such, the JavaScript runtime needs to know which scripts
++  // > are modules
++  // Looking at the page, it seems like the only thing that will break if we assume module is html
++  // style comments
++  let acorn_opts = { ecmaVersion: 2020, sourceType: 'module', locations: locations }
++  try {
++    tree = acorn.parse(content, acorn_opts);
++  } catch {
++    return null;
++    // tree = acorn_loose.parse(content, acorn_opts);
++  }
++  return tree;
++}
++
++
++module.exports = {
++  buildTree: buildTree,
++  identifiersFromNode: identifiersFromNode,
++  isFunction: isFunction,
++  isMethod: isMethod,
++  trackScope: trackScope,
++  trackVars: trackVars,
++  Environment: Environment,
++  EnvironmentTypes: EnvironmentTypes,
++  NodeTypes: NodeTypes,
++  MemberAccess: MemberAccess,
++  Variable: Variable
++};
+diff --git a/lib/internal/global-replacement/extractGlobals.js b/lib/internal/global-replacement/extractGlobals.js
+new file mode 100644
+index 0000000000..2ca5faaf53
+--- /dev/null
++++ b/lib/internal/global-replacement/extractGlobals.js
+@@ -0,0 +1,210 @@
++"use strict";
++
++const acorn_walk = require('internal/deps/acorn/acorn-walk/dist/walk');
++
++const globalNames = require('internal/global-replacement/globalNames')
++const {
++  trackScope,
++  trackVars,
++  NodeTypes,
++} = require('internal/global-replacement/astUtils')
++require('internal/global-replacement/acornWalkPatch')
++
++
++/**
++ * Class representing an identifier, used to track global object access
++ */
++class Identifier {
++  /**
++   * @param {String}  name  The name of the identifier
++   * @param {number?} start Start position of the identifier within the source code
++   * @param {number?} end   End position of the identifier within the source code
++   */
++  constructor(name, start, end) {
++    this.name = name;
++    this.start = start;
++    this.end = end;
++  }
++}
++
++
++// TODO: add class declarations
++// TODO: this whole thing could be "optimized" to basically return one large boolean expression, but
++// do we want that?
++/**
++ * Checks whether the given identifier node references an object that is in the current scope
++ * @param   {Object}   node      The node to check
++ * @param   {Object[]} ancestors List of AST ancestor nodes
++ * @returns {boolean}            true if the given identifier referencens an object in the current scope, else false
++ */
++function inGlobalNamespace(node, ancestors) {
++  // Has to be in global namespace if there is no parent
++  if (ancestors.length < 2) return true;
++  let parent = ancestors[ancestors.length - 2];
++  // Part of member expression
++  if (parent.type == NodeTypes.MemberExpression && parent.property === node) {
++    return false;
++  }
++  // Argument to a function / method
++  if ((parent.type === NodeTypes.Function ||
++    parent.type === NodeTypes.FunctionExpression ||
++    parent.type === NodeTypes.FunctionDeclaration) &&
++    parent.params.includes(node)) {
++    return false;
++  }
++  // Name of method definition
++  if (parent.type === NodeTypes.MethodDefinition && parent.key === node) {
++    return false;
++  }
++  // Name of function definition
++  if (parent.type === NodeTypes.FunctionDeclaration && parent.id === node) {
++    return false;
++  }
++  // Name of variable declaration
++  if (parent.type === NodeTypes.VariableDeclarator && parent.id === node) {
++    return false;
++  }
++  if (ancestors.length < 3) return true;
++  // Name of variable declaration in an array pattern
++  if (parent.type === NodeTypes.ArrayPattern &&
++      parent.elements.includes(node)) {
++    return false;
++  }
++  let grandParent = ancestors[ancestors.length - 3];
++  // Name of variable declaration in an object pattern
++  if (parent.type === NodeTypes.Property &&
++      grandParent.type === NodeTypes.ObjectPattern &&
++      grandParent.properties.includes(parent)) {
++    return false;
++  }
++  return true;
++}
++
++
++/**
++ * Indicate whether an identifier represents a global object
++ * @param   {Object}      node      The identifier node to check
++ * @param   {Environment} env       The current environment
++ * @param   {Object[]}    ancestors List of AST ancestor nodes
++ * @returns {boolean}               true if the given identifier represents a global object, else false
++ */
++function isGlobal(node, env, ancestors) {
++  return (node.type == NodeTypes.Identifier &&
++          globalNames.has(node.name) &&
++          !env.hasVarNamed(node.name) &&
++          inGlobalNamespace(node, ancestors))
++}
++
++
++/**
++ * Track which global objects are acessed
++ * @param {Object}      node          The current node of the AST
++ * @param {String}      type          The type of the current node
++ * @param {Environment} env           The current environment during the AST traversal
++ * @param {Object[]}    ancestors     List of AST ancestor nodes
++ * @param {Set}         globalMembers Set containing all accessed global members
++ */
++function trackGlobals(node, type, env, ancestors, globals) {
++    // Record globals
++    if (type === NodeTypes.Identifier) {
++      if (isGlobal(node, env, ancestors)) {
++        globals.push(new Identifier(node.name, node.start, node.end));
++      }
++    }
++}
++
++
++// TODO: i currently do not differentiate between indexing into an array module, and accessing an
++// object property.
++// In theory i can tell by looking at the type of the module, but not sure if i want that (doesn't
++// matter too much though, it's just perf)
++/**
++ * Track which members of global objects are accessed
++ * @param {Object}      node          The current node of the AST
++ * @param {String}      type          The type of the current node
++ * @param {Environment} env           The current environment during the AST traversal
++ * @param {Set}         globalMembers Set containing all accessed global members
++ */
++function trackGlobalMembers(node, type, env, ancestors, globalMembers) {
++    if (type === NodeTypes.MemberExpression) {
++      // If the property is not a literal, nor an identifier, we can't statically tell which
++      // property is accessed.
++      if ((node.property.type === NodeTypes.Identifier ||
++           node.property.type === NodeTypes.Literal) &&
++          isGlobal(node.object, env, ancestors.concat(node.object))) {
++        globalMembers.add(`${node.object.name}.${node.property.name || node.property.value.toString()}`)
++      }
++    } else if (type === NodeTypes.VariableDeclaration) {
++      for (const declarator of node.declarations) {
++        // TODO: we can't really deal with the `...rest` RestElements
++        if (declarator.id.type === NodeTypes.ObjectPattern &&
++            declarator.init &&
++            isGlobal(declarator.init, env, ancestors.concat([declarator, declarator.init]))) {
++          for (const property of declarator.id.properties) {
++            if (property.type === NodeTypes.Property) {
++              globalMembers.add(`${declarator.init.name}.${property.key.name}`);
++            } else if (property.type === NodeTypes.RestElement) {
++              // TODO: implement me, maybe?
++            } else {
++              throw Error(`Unknown object pattern property type ${property.type}`);
++            }
++          }
++        } else if (declarator.id.type === NodeTypes.ArrayPattern &&
++                   declarator.init &&
++                   isGlobal(declarator.init, env, ancestors.concat([declarator, declarator.init]))) {
++          // TODO: when i want to add support for the rest element, this has to check whether the
++          // last element is a rest element and then act accordingly
++          for (let i = 0; i < declarator.id.elements.length; ++i) {
++            if (declarator.id.elements[i] !== null) {
++              globalMembers.add(`${declarator.init.name}.${i}`);
++            }
++          }
++        }
++      }
++    }
++}
++
++
++/**
++ * Get lists of all accesses global objects, and their respective members, for a given AST
++ * @param   {Object} node     The root node of the AST
++ * @param   {Object} state    Additional state for the AST traversal
++ * @param   {String} override Override for the type of the root node
++ * @returns {Object}          Object containing a list of the accessed global objects and their members
++ */
++function findGlobalsInAST(node, state, override) {
++  let globals = [];
++  let globalMembers = new Set();
++  let ancestors = [];
++  let env;
++  (function c(node, st, override) {
++    let type = override || node.type;
++    // Build ancestor array
++    let isNew = node !== ancestors[ancestors.length - 1];
++    if (isNew) ancestors.push(node);
++    // Track scope
++    let prev_env = env;
++    env = trackScope(node, type, ancestors, env);
++
++    // Track globals and members
++    trackVars(node, type, env);
++    trackGlobals(node, type, env, ancestors, globals);
++    trackGlobalMembers(node, type, env, ancestors, globalMembers);
++
++    // Walk children
++    acorn_walk.base[type](node, st, c);
++
++    // Return to previous environment / scope
++    if (type === NodeTypes.BlockStatement) env = prev_env;
++    // Remove self from ancestors
++    if (isNew) ancestors.pop();
++  })(node, state, override);
++  // I *want* to keep the implementation of the list with the identifiers, because i need that for
++  // the interpreter implementation, however the policy only needs a set of the modules itself.
++  return {globals: globals, globalMembers: globalMembers};
++}
++
++
++module.exports = {
++  extractGlobals: findGlobalsInAST
++};
+diff --git a/lib/internal/global-replacement/globalNames.js b/lib/internal/global-replacement/globalNames.js
+new file mode 100644
+index 0000000000..2003967bb5
+--- /dev/null
++++ b/lib/internal/global-replacement/globalNames.js
+@@ -0,0 +1,148 @@
++// Created through the script Misc/download-nodejs-globals.py, variables from the nodejs docs at
++// https://nodejs.org/dist/latest-v18.x/docs/api/globals.json
++// and the MDN docs at
++// https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects
++// and does contain experimental globals for now!
++globals = new Set(
++  ['AbortController',
++   'AggregateError',
++   'Array',
++   'ArrayBuffer',
++   'AsyncFunction',
++   'AsyncGenerator',
++   'AsyncGeneratorFunction',
++   'Atomics',
++   'BigInt',
++   'BigInt64Array',
++   'BigUint64Array',
++   'Blob',
++   'Boolean',
++   'BroadcastChannel',
++   'Buffer',
++   'ByteLengthQueuingStrategy',
++   'CompressionStream',
++   'CountQueuingStrategy',
++   'Crypto',
++   'CryptoKey',
++   'CustomEvent',
++   'DOMException',
++   'DataView',
++   'Date',
++   'DecompressionStream',
++   'Error',
++   'EvalError',
++   'Event',
++   'EventTarget',
++   'Float32Array',
++   'Float64Array',
++   'FormData',
++   'Function',
++   'Generator',
++   'GeneratorFunction',
++   'Headers',
++   'Infinity',
++   'Int16Array',
++   'Int32Array',
++   'Int8Array',
++   'InternalError',
++   'Intl',
++   'Intl.Collator',
++   'Intl.DateTimeFormat',
++   'Intl.ListFormat',
++   'Intl.Locale',
++   'Intl.NumberFormat',
++   'Intl.PluralRules',
++   'Intl.RelativeTimeFormat',
++   'JSON',
++   'Map',
++   'Math',
++   'MessageChannel',
++   'MessageEvent',
++   'MessagePort',
++   'NaN',
++   'Number',
++   'Object',
++   'Promise',
++   'Proxy',
++   'RangeError',
++   'ReadableByteStreamController',
++   'ReadableStream',
++   'ReadableStreamBYOBReader',
++   'ReadableStreamBYOBRequest',
++   'ReadableStreamDefaultController',
++   'ReadableStreamDefaultReader',
++   'ReferenceError',
++   'Reflect',
++   'RegExp',
++   'Request',
++   'Response',
++   'Set',
++   'SharedArrayBuffer',
++   'String',
++   'SubtleCrypto',
++   'Symbol',
++   'SyntaxError',
++   'TextDecoder',
++   'TextDecoderStream',
++   'TextEncoder',
++   'TextEncoderStream',
++   'TransformStream',
++   'TransformStreamDefaultController',
++   'TypeError',
++   'URIError',
++   'URL',
++   'URLSearchParams',
++   'Uint16Array',
++   'Uint32Array',
++   'Uint8Array',
++   'Uint8ClampedArray',
++   'WeakMap',
++   'WeakSet',
++   'WebAssembly',
++   'WebAssembly.CompileError',
++   'WebAssembly.Instance',
++   'WebAssembly.LinkError',
++   'WebAssembly.Memory',
++   'WebAssembly.Module',
++   'WebAssembly.RuntimeError',
++   'WebAssembly.Table',
++   'WritableStream',
++   'WritableStreamDefaultController',
++   'WritableStreamDefaultWriter',
++   '__dirname',
++   '__filename',
++   'atob',
++   'btoa',
++   'clearImmediate',
++   'clearInterval',
++   'clearTimeout',
++   'console',
++   'crypto',
++   'decodeURI',
++   'decodeURIComponent',
++   'encodeURI',
++   'encodeURIComponent',
++   'escape',
++   'eval',
++   //'exports',
++   'fetch',
++   'global',
++   'globalThis',
++   'isFinite',
++   'isNaN',
++   'module',
++   'parseFloat',
++   'parseInt',
++   'performance',
++   'process',
++   'queueMicrotask',
++   'require',
++   'setImmediate',
++   'setInterval',
++   'setTimeout',
++   'structuredClone',
++   'undefined',
++   'unescape']
++);
++
++module.exports = globals;
+diff --git a/lib/internal/global-replacement/replaceGlobals.js b/lib/internal/global-replacement/replaceGlobals.js
+new file mode 100644
+index 0000000000..0fa1aa3982
+--- /dev/null
++++ b/lib/internal/global-replacement/replaceGlobals.js
+@@ -0,0 +1,74 @@
++const acorn = require('internal/deps/acorn/acorn/dist/acorn');
++const { extractGlobals } = require('internal/global-replacement/extractGlobals')
++
++/**
++ * Create an AST from JavaScript source code
++ * @param   {String} source The source code
++ * @returns {Object}        The resulting AST
++ */
++function parseAst(source) {
++  let opts = { ecmaVersion: 'latest', sourceType: 'module', locations: true };
++  return acorn.parse(source, opts);
++}
++
++
++/**
++ * Remove the first line of a given string
++ * @param   {String} text The string
++ * @returns {String}      The string without the first line
++ */
++function removeFirstLine(text) {
++  return text.split('\n').splice(1).join('\n');
++}
++
++/**
++ * Remove the shebang line from the given string, if one exists
++ * @param   {String} sourceCode The source code
++ * @returns {String}            The source code without a shebang line
++ */
++function removeShebang(sourceCode) {
++  if (sourceCode.startsWith('#!')) {
++    sourceCode = removeFirstLine(sourceCode);
++  }
++  return sourceCode;
++}
++
++/**
++ * Replace access to a given list of identifiers, to access to identically named members of a
++ * `localGlobals` object.
++ * @param   {String}       code                The source code in which to perform the replacement
++ * @param   {Identifier[]} identifiersToChange The identifiers to replace
++ * @returns {String}                           The modified source code
++ */
++function modifyCode(code, identifiersToChange) {
++  // Sort identifiers in descending order of their start position
++  identifiersToChange.sort((a, b) => {
++    if (a.start < b.start) return 1;
++    else if (a.start > b.start) return -1;
++    else return 0;
++  });
++  for (const identifier of identifiersToChange) {
++    code = code.slice(0, identifier.start) + 'localGlobals.' + identifier.name + code.slice(identifier.end);
++  }
++  return code;
++}
++
++// TODO: ignore "exports" and "module.exports"
++/**
++ * Replace global object accesses in the source code with accesses to identically named members of a
++ * `localGlobals` object.
++ * @param   {String} sourceCode The source code in which to perform the replacement
++ * @returns {String}            The resulting changed source code
++ */
++function replaceGlobals(sourceCode) {
++  sourceCode = removeShebang(sourceCode);
++  const ast = parseAst(sourceCode);
++  if (ast === null) {
++    return sourceCode;
++  }
++  const { globals, globalMembers } = extractGlobals(ast);
++  const changedCode = modifyCode(sourceCode, Array.from(globals));
++  return changedCode;
++}
++
++module.exports = { replaceGlobals: replaceGlobals }
+diff --git a/lib/internal/global-replacement/setUtils.js b/lib/internal/global-replacement/setUtils.js
+new file mode 100644
+index 0000000000..d4e7e1a10a
+--- /dev/null
++++ b/lib/internal/global-replacement/setUtils.js
+@@ -0,0 +1,80 @@
++/**
++ * Method of the Set class that creates the union of the calling object, and another set
++ * @param   {Set} other Other set to create the union with
++ * @returns {Set}       New set representing the set union
++ */
++function setUnion(other) {
++  let s = new Set();
++  for (const element of this) {
++    s.add(element);
++  }
++  for (const element of other) {
++    s.add(element);
++  }
++  return s;
++}
++
++/**
++ * Method of the Set class that creates the intersection of the calling object, and another set
++ * @param   {Set} other Other set to create the intersection with
++ * @returns {Set}       New set representing the set intersection
++ */
++function setIntersection(other) {
++  let s = new Set();
++  for (const element of this) {
++    if (other.has(element)) {
++      s.add(element);
++    }
++  }
++  return s;
++}
++
++/**
++ * Method of the Set class that creates the difference of the calling object, and another set
++ * @param   {Set} other Other set to create the difference with
++ * @returns {Set}       New set representing the set difference
++ */
++function setDifference(other) {
++  let s = new Set();
++  for (const element of this) {
++    if (!other.has(element)) {
++      s.add(element);
++    }
++  }
++  return s;
++}
++
++/**
++ * Method of the Set class that filters the objects inside the set by a given filter function
++ * @param   {Function} filter Function that takes an element, and returns true if it passes the filter, and false else
++ * @returns {Set}             New set only containing the elements that passed the filter
++ */
++function setFilter(filter) {
++  const s = new Set();
++  for (const element of this) {
++    if (filter(element)) {
++      s.add(element);
++    }
++  }
++  return s;
++}
++
++/**
++ * Method of the Set class that maps the objects inside the set with a given map function
++ * @param   {Function} map Function that takes an element and maps it to the desired new value
++ * @returns {Set}          New set only containing the elements that passed the filter
++ */
++function setMap(map) {
++  const s = new Set();
++  for (const element of this) {
++    s.add(map(element));
++  }
++  return s;
++}
++
++// This is very illegal but we do it anyways
++Set.prototype.union = setUnion;
++Set.prototype.intersection = setIntersection;
++Set.prototype.filter = setFilter;
++Set.prototype.map = setMap;
++Set.prototype.difference = setDifference;
+diff --git a/lib/internal/modules/cjs/helpers.js b/lib/internal/modules/cjs/helpers.js
+index 3ae63b4619..a5aef639d6 100644
+--- a/lib/internal/modules/cjs/helpers.js
++++ b/lib/internal/modules/cjs/helpers.js
+@@ -3,6 +3,7 @@
+ const {
+   ArrayPrototypeForEach,
+   ArrayPrototypeJoin,
++  ArrayPrototypePush,
+   ArrayPrototypeSome,
+   ObjectDefineProperty,
+   ObjectPrototypeHasOwnProperty,
+@@ -13,11 +14,21 @@ const {
+   StringPrototypeSlice,
+   StringPrototypeStartsWith,
+ } = primordials;
++const policyUtils = require('internal/policyUtils');
+ const {
+   ERR_MANIFEST_DEPENDENCY_MISSING,
+   ERR_UNKNOWN_BUILTIN_MODULE
+ } = require('internal/errors').codes;
+ const { NativeModule } = require('internal/bootstrap/loaders');
++let builtinModules = [];
++for (const { 0: id, 1: mod } of NativeModule.map) {
++  if (mod.canBeRequiredByUsers &&
++    NativeModule.canBeRequiredWithoutScheme(id)) {
++    ArrayPrototypePush(builtinModules, id);
++  }
++}
++policyUtils.log(`NativeModules: ${builtinModules}.`, 'yellow', 'black');
++
+ 
+ const { validateString } = require('internal/validators');
+ const path = require('path');
+@@ -59,6 +70,7 @@ function makeRequireFunction(mod, redirects) {
+   const Module = mod.constructor;
+ 
+   let require;
++  // redirects are defined if we use the experimental policy, should usually *not* be the case.
+   if (redirects) {
+     const id = mod.filename || mod.id;
+     const conditions = cjsConditions;
+@@ -99,7 +111,17 @@ function makeRequireFunction(mod, redirects) {
+     };
+   } else {
+     require = function require(path) {
+-      return mod.require(path);
++      if (!builtinModules.includes(path)) {
++        policyUtils.log(`Normie requiring ${path}.`, 'black', 'white');
++        // policyUtils.log(`Mod: ${mod.toString()}`, 'black', 'white');
++        // policyUtils.log(`Mod.require: ${mod.require.toString()}`, 'black', 'white');
++        let module = mod.require(path);
++        // policyUtils.log(`Required module ${path}: ${module}`, 'black', 'white');
++        // policyUtils.log(`Required module ${path}: ${module.toString()}`, 'black', 'white');
++        return module;
++      }
++      policyUtils.log(`Custom requiring ${path}.`, 'black', 'white');
++      return policyUtils.pruneModule(mod.filename || mod.id, path, mod.require(path));
+     };
+   }
+ 
+diff --git a/lib/internal/modules/cjs/loader.js b/lib/internal/modules/cjs/loader.js
+index de919e7406..bf0a82183b 100644
+--- a/lib/internal/modules/cjs/loader.js
++++ b/lib/internal/modules/cjs/loader.js
+@@ -139,6 +139,8 @@ const {
+   packageExportsResolve,
+   packageImportsResolve
+ } = require('internal/modules/esm/resolve');
++const policyUtils = require('internal/policyUtils');
++const { replaceGlobals } = require('internal/global-replacement/replaceGlobals');
+ 
+ const isWindows = process.platform === 'win32';
+ 
+@@ -1036,6 +1038,7 @@ function wrapSafe(filename, content, cjsModuleInstance) {
+       'module',
+       '__filename',
+       '__dirname',
++      'localGlobals',
+     ], {
+       filename,
+       importModuleDynamically(specifier, _, importAssertions) {
+@@ -1102,8 +1105,9 @@ Module.prototype._compile = function(content, filename) {
+     result = inspectorWrapper(compiledWrapper, thisValue, exports,
+                               require, module, filename, dirname);
+   } else {
++    const localGlobals = policyUtils.makeLocalGlobals(this, exports, require, module, filename, dirname);
+     result = ReflectApply(compiledWrapper, thisValue,
+-                          [exports, require, module, filename, dirname]);
++                          [exports, require, module, filename, dirname, localGlobals]);
+   }
+   hasLoadedAnyUserCJSModule = true;
+   if (requireDepth === 0) statCache = null;
+@@ -1120,6 +1124,7 @@ Module._extensions['.js'] = function(module, filename) {
+     cached.source = undefined;
+   } else {
+     content = fs.readFileSync(filename, 'utf8');
++    content = replaceGlobals(content);
+   }
+   if (StringPrototypeEndsWith(filename, '.js')) {
+     const pkg = readPackageScope(filename);
+diff --git a/lib/internal/policyUtils.js b/lib/internal/policyUtils.js
+new file mode 100644
+index 0000000000..bb3b3b6db1
+--- /dev/null
++++ b/lib/internal/policyUtils.js
+@@ -0,0 +1,396 @@
++'use strict';
++
++const console = require('console');
++const fs = require('fs');
++const path = require('path');
++const policyPath = '/tmp/node_policy.json'
++if (!fs.existsSync(policyPath)) {
++  throw Error(`Could not find policy at ${policyPath}.`)
++}
++const { policyCoarse, policyFine, memberAccessTracing } = JSON.parse(fs.readFileSync(policyPath));
++if (policyCoarse === undefined || (memberAccessTracing && policyFine === undefined)) {
++  throw Error('Missing required policy in policy file.');
++}
++const ANSI_START = String.fromCharCode(0x1B);
++const ANSI_RESET = `${ANSI_START}[m`;
++
++const fgColorMap = {
++  black: '30',
++  red: '31',
++  green: '32',
++  yellow: '33',
++  blue: '34',
++  magenta: '35',
++  cyan: '36',
++  white: '37',
++  brightBlack: '90',
++  brightRed: '91',
++  brightGreen: '92',
++  brightYellow: '93',
++  brightBlue: '94',
++  brightMagenta: '95',
++  brightCyan: '96',
++  brightWhite: '97'
++}
++
++const bgColorMap = {
++  black: '40',
++  red: '41',
++  green: '42',
++  yellow: '43',
++  blue: '44',
++  magenta: '45',
++  cyan: '46',
++  white: '47',
++  brightBlack: '100',
++  brightRed: '101',
++  brightGreen: '102',
++  brightYellow: '103',
++  brightBlue: '104',
++  brightMagenta: '105',
++  brightCyan: '106',
++  brightWhite: '107'
++}
++
++function ansi_color(fgColor='white', bgColor='black') {
++  return `${ANSI_START}[${fgColorMap[fgColor]};${bgColorMap[bgColor]}m`
++}
++
++function log(s, fgColor='magenta', bgColor='black') {
++  console.log(ansi_color(fgColor, bgColor) + s + ANSI_RESET);
++}
++
++
++/**
++ * Indicates whether a package is allowed to use a certain module member
++ * @param   {String} importingPackageName Name of the package
++ * @param   {String} capability           Name of the module and its member, separated by a `.`
++ * @return  {boolean}                     true if allowed to use, else false
++ */
++function allowedToUseModuleMember(importingPackageName, capability) {
++  return (policyFine[importingPackageName] || {modules: []})["modules"].includes(capability);
++}
++
++/**
++ * Indicates whether a package is allowed to import a certain built-in module
++ * @param   {String} importingPackageName Name of the package
++ * @param   {String} importedPath         Name of the module that is being imported
++ * @return  {boolean}                     true if allowed to import, else false
++ */
++function allowedToImport(importingPackageName, importedPath) {
++  return (policyCoarse[importingPackageName] || {modules: []})["modules"].includes(importedPath);
++}
++
++/**
++ * Indicates whether a package is allowed to use a certain global member
++ * @param   {String} importingPackageName Name of the package
++ * @param   {String} capability           Name of the global and its member, separated by a `.`
++ * @return  {boolean}                     true if allowed to use, else false
++ */
++function allowedToUseGlobalMember(importingPackageName, capability) {
++  return (policyFine[importingPackageName] || {globals: []})["globals"].includes(capability);
++}
++
++/**
++ * Indicates whether a package is allowed to access a certain global object
++ * @param   {String}  importingPackageName Name of the package
++ * @param   {String}  globalName           Name of the global object
++ * @returns {boolean}                      true if allowed to access, else false
++ */
++function allowedToAccessGlobal(importingPackageName, globalName) {
++  return (policyCoarse[importingPackageName] || {globals: []})["globals"].includes(globalName);
++}
++
++/**
++ * Get the package name to a given path, assuming that the path points to a module that's part of a
++ * package
++ * @param   {String}  modulePath Path to the module
++ * @returns {String?}            Name of the corresponding package
++ */
++function pathToPackageName(modulePath) {
++  let pathParts = modulePath.split(path.sep);
++  let packageName = null;
++  if (pathParts.includes('node_modules')) {
++    // We have a "normal" installed package - look for package name through `node_modules`
++    let nameIndex = pathParts.indexOf('node_modules') + 1;
++    packageName = pathParts[nameIndex];
++  } else {
++    // Appears to be a locally installed packaage - look for package.json
++    let packageJson = reverseSearchPackageJson(modulePath);
++    if (packageJson != null) {
++      packageName = packageJson.name;
++    }
++  }
++  return packageName;
++}
++
++/**
++ * Get the contents of the closest `package.json` file, searching the given path from bottom to top.
++ * @param   {String}  packagePath The path in which to search
++ * @returns {Object?}             The content of the closest `package.json` file, or `null` if none was found
++ */
++function reverseSearchPackageJson(packagePath) {
++  while (packagePath != '/') {
++    packagePath = path.dirname(packagePath);
++    if (containsPackageJson(packagePath)) {
++      let packageJson = JSON.parse(fs.readFileSync(path.join(packagePath, 'package.json')));
++      return packageJson;
++    }
++  }
++  return null
++}
++
++/**
++ * Check if the given path contains a file with the name `package.json`
++ * @param   {String}  packagePath The path to check
++ * @returns {boolean}             true if a file named `package.json` is present in the given directory, else false
++ */
++function containsPackageJson(packagePath) {
++  const dir = fs.opendirSync(packagePath);
++  let dirent = dir.readSync();
++  while (dirent != null) {
++    if (dirent.name == 'package.json') {
++      return true;
++    }
++    dirent = dir.readSync();
++  }
++  return false;
++}
++
++// TODO: implement mocks for more types
++function createMockObject(objectName, objectType) {
++  if (objectType === 'function') {
++    return createMockFunction(objectName);
++  } else {
++    return {};
++  }
++}
++
++function createMockFunction(functionName) {
++  try {
++    return new Function(`return function ${functionName}() {return ${functionName};};`)();
++  } catch (SyntaxError) {
++    return new Function(`return function mocky() {return mocky;};`)();
++  }
++}
++
++/**
++ * Given an object, replace a named property with a dummy function, if the property is a function
++ * @param   {Object} object The object in which the property is replaced
++ * @param   {String} prop   The name of the property to replace
++ * @returns {null}
++ */
++function replaceProperty(object, prop) {
++  if (typeof object[prop] === 'function') {
++    object[prop] = createMockFunction(prop);
++  } else {
++    try {
++      object[prop] = {};
++    } catch {
++      // Don't clone "internal"/read only properties like ".length"
++    }
++  }
++}
++
++/**
++ * Create a shallow copy of an object
++ * @param   {Object} object The object to copy
++ * @returns {Object}        The copied object
++ */
++function cloneObject(object) {
++  if (object === undefined || object === null) {
++    return object;
++  }
++  let newObject;
++  if (typeof object == 'function') {
++    newObject = object.bind({});
++  } else {
++    newObject = {};
++  }
++  for (const prop of Object.getOwnPropertyNames(object)) {
++    try {
++      newObject[prop] = object[prop];
++    } catch {
++      // Don't clone "internal"/read only properties like ".length"
++    }
++  }
++  return newObject;
++}
++
++function cloneObjectMockingFunction(object, objectName='mocky') {
++  if (object === undefined || object === null) {
++    return object;
++  }
++  let newObject = createMockObject(objectName, typeof object);
++  for (const prop of Object.getOwnPropertyNames(object)) {
++    try {
++      newObject[prop] = object[prop];
++    } catch {
++      // Don't clone "internal"/read only properties like ".length"
++    }
++  }
++  return newObject;
++}
++
++/**
++ * Create a copy of an object, replacing its members with dummies
++ * @param   {Object} object     The object to be copied
++ * @param   {String} objectName The identifying member name at which the object is stored
++ * @returns {Object}            The cloned object
++ */
++function cloneObjectDummy(object, objectName) {
++  if (object === undefined || object === null) {
++    return object;
++  }
++  let newObject = createMockObject(objectName, typeof object);
++  for (const prop of Object.keys(object)) {
++    if ((typeof object[prop]) == 'function') {
++      newObject[prop] = createMockFunction(objectName);
++    } else {
++      newObject[prop] = object[prop];
++    }
++  }
++  return newObject;
++}
++
++/**
++ * Restrict a given module, according to the policy of the package the importing module belongs to
++ * @param   {String} importerPath Path to the importing module
++ * @param   {String} importee     Name of the module that is imported
++ * @param   {Object} module       The imported module
++ * @returns {Object}              The restricted copy of the requested module
++ */
++function pruneModule(importerPath, importee, module) {
++  let clonedModule;
++  const importerPackageName = pathToPackageName(importerPath);
++  if (allowedToImport(importerPackageName, importee)) {
++    clonedModule = cloneObject(module);
++  } else {
++    clonedModule = cloneObjectMockingFunction(module, importee);
++  }
++  if (memberAccessTracing === true) {
++    // Check for all members individually whether they should be replaced
++    for (const prop of Object.keys(clonedModule)) {
++      const capability = `${importee}.${prop}`;
++      if (!allowedToUseModuleMember(importerPackageName, capability)) {
++        log(`Blocked access to ${capability} for ${importerPackageName}.`);
++        replaceProperty(clonedModule, prop);
++      }
++    }
++  } else {
++    // Check once for the import, and if not allowed, replace all members
++    if (!allowedToImport(importerPackageName, importee)) {
++      log(`Blocked access to ${importee} for ${importerPackageName}.`);
++      for (const prop of Object.keys(module)) {
++        replaceProperty(clonedModule, prop);
++      }
++    }
++  }
++  return clonedModule;
++}
++
++/**
++ * Given a package name and global object name, creates a restricted copy of that global object
++ * adhering to the policy of the respective package
++ * @param   {String} importerPackageName Name of the package that to restrict the global object for
++ * @param   {String} globalName          Name of the global object to copy
++ * @param   {Object} globalCopy          Object containing clones of all global objects
++ * @returns {Object}                     Restricted copy of the respective global object
++ */
++function copyAndPruneGlobalObject(importerPackageName, globalName, globalCopy) {
++  let object;
++  const originalGlobal = globalCopy[globalName];
++  log(`Copying and pruning global ${globalName}.`, 'red', 'black');
++  if (memberAccessTracing === true) {
++    let clonedGlobal;
++    if (allowedToAccessGlobal(importerPackageName, globalName)) {
++      clonedGlobal = cloneObject(originalGlobal);
++    } else {
++      clonedGlobal = cloneObjectMockingFunction(originalGlobal, globalName);
++    }
++    if (originalGlobal === undefined || originalGlobal === null) {
++      return clonedGlobal;
++    }
++    for (const member of Object.getOwnPropertyNames(clonedGlobal)) {
++      const capability = `${globalName}.${member}`;
++      if (!allowedToUseGlobalMember(importerPackageName, capability)) {
++        log(`Blocked access to ${capability} for ${importerPackageName}.`);
++        replaceProperty(clonedGlobal, member);
++      }
++    }
++    object = clonedGlobal;
++  } else {
++    if (!allowedToAccessGlobal(importerPackageName, globalName)) {
++      log(`Blocked access to ${globalName} for ${importerPackageName}.`);
++      object = cloneObjectDummy(originalGlobal, globalName);
++    } else {
++      object = originalGlobal;
++    }
++  }
++  log(`Type of ${globalName}: ${typeof object}.`, 'green', 'black');
++  return object;
++}
++
++/**
++ * Combines "regular" global objects with the module specific global objects
++ * @param   {Object}   exports  The modules' `exports` object
++ * @param   {Function} require  The modules' `require` function
++ * @param   {Object}   module   The modules' `module` object
++ * @param   {String}   filename The modules' `__filename` attribute
++ * @param   {String}   dirname  The modules' `__dirname` attribute
++ * @returns {Object}            Object containing the combined global objects
++ */
++function combineGlobals(exports, require, module, filename, dirname) {
++  const specialGlobals = {
++    exports: exports,
++    require: require,
++    module: module,
++    __filename: filename,
++    __dirname: dirname
++  }
++  const globalCopy = {};
++  for (const prop of Object.getOwnPropertyNames(global)) {
++    globalCopy[prop] = global[prop];
++  }
++  Object.assign(globalCopy, specialGlobals);
++  return globalCopy;
++}
++
++/**
++ * Creates an object containing a restricted version of the global objects for a given module
++ * @param   {Module}   mod      The module that the globals object is built for
++ * @param   {Object}   exports  The modules' `exports` object
++ * @param   {Function} require  The modules' `require` function
++ * @param   {Object}   module   The modules' `module` object
++ * @param   {String}   filename The modules' `__filename` attribute
++ * @param   {String}   dirname  The modules' `__dirname` attribute
++ * @returns {Object}            Object containing global objects, restricted for the given module `mod`
++ */
++function makeLocalGlobals(mod, exports, require, module, filename, dirname) {
++  const importerPath = mod.filename || mod.id; // This is taken from the makeRequireFunction implementation
++  const importerPackageName = pathToPackageName(importerPath);
++  const combinedGlobals = combineGlobals(exports, require, module, filename, dirname);
++  const localGlobals = {}
++  for (let globalObjectName of Object.getOwnPropertyNames(combinedGlobals)) {
++    if (globalObjectName === 'global' || globalObjectName === 'globalThis') {
++      // They're just references to the global object itself.
++      continue;
++    }
++    localGlobals[globalObjectName] = copyAndPruneGlobalObject(
++      importerPackageName, globalObjectName, combinedGlobals
++    );
++  }
++  // Always give a module access to its own `module` global, which is a reference to itself
++  // This is necessary to e.g. make exports work.
++  localGlobals['module'] = combinedGlobals['module'];
++  // Set up the two self-referential members
++  localGlobals['global'] = localGlobals;
++  localGlobals['globalThis'] = localGlobals;
++  return localGlobals;
++}
++
++module.exports = {
++  pruneModule: pruneModule,
++  makeLocalGlobals: makeLocalGlobals,
++  log: log
++}
