@@ -1,0 +1,16 @@
+{
+    "name": "npm-dependency-guardian",
+    "version": "0.1.0",
+    "description": "Guards your project from malicious dependency updates (maybe).",
+    "main": "src/main.js",
+    "scripts": {
+        "test": "echo\"Error: no test specified\" && exit 1"
+    },
+    "author": "Timo Pohl",
+    "license": "MIT",
+    "dependencies": {
+        "acorn": "~8.7.1",
+        "acorn-walk": "~8.2.0",
+        "yargs": "~17.5.1"
+    }
+}
